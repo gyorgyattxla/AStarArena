@@ -17,17 +17,19 @@ import java.util.stream.Collectors;
 public class DockerExecutionService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    // This maps to the shared volume defined in docker-compose.yml
     private static final String WORKSPACE_DIR = "/workspace";
     private static final String VOLUME_NAME = "sokoban_eval_workspace";
 
     public DockerExecutionResult evaluateHeuristic(String userCode, String mapContent) {
         String sessionId = UUID.randomUUID().toString();
         Path sessionDir = Paths.get(WORKSPACE_DIR, sessionId);
+        String containerName = "eval-" + sessionId;
 
         try {
             Files.createDirectories(sessionDir);
             File sourceFile = new File(sessionDir.toFile(), "JudgeRunner.java");
+            File stdoutFile = new File(sessionDir.toFile(), "stdout.txt");
+            File stderrFile = new File(sessionDir.toFile(), "stderr.txt");
 
             String fullSource = buildRunnerSourceCode(userCode, mapContent);
             Files.writeString(sourceFile.toPath(), fullSource);
@@ -50,38 +52,54 @@ public class DockerExecutionService {
 
             ProcessBuilder runPb = new ProcessBuilder(
                     "docker", "run", "--rm",
+                    "--name", containerName,
                     "--network", "none",
                     "--memory", "512m",
                     "--cpus", "1.0",
-                    "-v", VOLUME_NAME + ":/workspace",
+                    "--user", "nobody",
+                    "-v", VOLUME_NAME + ":/workspace:ro",
                     "-w", "/workspace/" + sessionId,
                     "eclipse-temurin:21-jdk-alpine",
                     "java", "JudgeRunner"
             );
+
+            runPb.redirectOutput(stdoutFile);
+            runPb.redirectError(stderrFile);
+
             Process runProcess = runPb.start();
-
-            String output = new BufferedReader(new InputStreamReader(runProcess.getInputStream()))
-                    .lines().collect(Collectors.joining("\n"));
-
-            String errorOutput = new BufferedReader(new InputStreamReader(runProcess.getErrorStream()))
-                    .lines().collect(Collectors.joining("\n"));
 
             boolean finished = runProcess.waitFor(15, TimeUnit.SECONDS);
 
             if (!finished) {
                 runProcess.destroyForcibly();
-                return new DockerExecutionResult(false, false, 0, 0, "Execution timed out (infinite loop or too slow).");
+
+                new ProcessBuilder("docker", "rm", "-f", containerName).start().waitFor();
+
+                return new DockerExecutionResult(false, false, 0, 0, "Execution timed out (Infinite loop detected).");
             }
+
+            String output = Files.exists(stdoutFile.toPath()) ? Files.readString(stdoutFile.toPath()) : "";
+            String errorOutput = Files.exists(stderrFile.toPath()) ? Files.readString(stderrFile.toPath()) : "";
 
             if (runProcess.exitValue() != 0) {
-                return new DockerExecutionResult(false, false, 0, 0, "Runtime Error: " + errorOutput);
+                return new DockerExecutionResult(false, false, 0, 0, "Runtime Error / OOM. Error: " + errorOutput + " | Output: " + output);
             }
 
-            return objectMapper.readValue(output, DockerExecutionResult.class);
+            int jsonStartIndex = output.lastIndexOf('{');
+            if (jsonStartIndex >= 0) {
+                String cleanJson = output.substring(jsonStartIndex);
+                return objectMapper.readValue(cleanJson, DockerExecutionResult.class);
+            } else {
+                return new DockerExecutionResult(false, false, 0, 0, "Execution failed. Raw output: " + output);
+            }
 
         } catch (Exception e) {
             return new DockerExecutionResult(false, false, 0, 0, "System Error: " + e.getMessage());
         } finally {
+            try {
+                new ProcessBuilder("docker", "rm", "-f", containerName).start().waitFor();
+            } catch (Exception ignored) {}
+
             deleteDirectory(sessionDir.toFile());
         }
     }

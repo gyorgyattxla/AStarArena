@@ -31,8 +31,6 @@ public class HeuristicSubmissionService {
         submission.setAuthor(user);
         submission.setStatus(StatusEnum.PENDING);
         submission.setSubmittedAt(LocalDateTime.now());
-        submission.setNodesExpanded(0L);
-        submission.setExecutionTimeMs(0L);
 
         HeuristicSubmission savedSubmission = submissionRepository.save(submission);
 
@@ -49,6 +47,8 @@ public class HeuristicSubmissionService {
     public List<HeuristicSubmission> getLeaderboard() {
         return submissionRepository.findAll().stream()
                 .filter(sub -> sub.getStatus() == StatusEnum.COMPLETED)
+                .filter(sub -> sub.getNodesExpanded() != null && sub.getExecutionTimeMs() != null)
+                .filter(sub -> sub.getNodesExpanded() > 0)
                 .sorted(Comparator.comparingLong(HeuristicSubmission::getNodesExpanded)
                         .thenComparingLong(HeuristicSubmission::getExecutionTimeMs))
                 .collect(Collectors.toList());
