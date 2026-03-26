@@ -54,8 +54,8 @@ public class DockerExecutionService {
                     "docker", "run", "--rm",
                     "--name", containerName,
                     "--network", "none",
-                    "--memory", "512m",
-                    "--cpus", "1.0",
+                    "--memory", "2g",
+                    "--cpus", "2.0",
                     "--user", "nobody",
                     "-v", VOLUME_NAME + ":/workspace:ro",
                     "-w", "/workspace/" + sessionId,
@@ -68,13 +68,11 @@ public class DockerExecutionService {
 
             Process runProcess = runPb.start();
 
-            boolean finished = runProcess.waitFor(15, TimeUnit.SECONDS);
+            boolean finished = runProcess.waitFor(60, TimeUnit.SECONDS);
 
             if (!finished) {
                 runProcess.destroyForcibly();
-
                 new ProcessBuilder("docker", "rm", "-f", containerName).start().waitFor();
-
                 return new DockerExecutionResult(false, false, 0, 0, "Execution timed out (Infinite loop detected).");
             }
 
@@ -99,7 +97,6 @@ public class DockerExecutionService {
             try {
                 new ProcessBuilder("docker", "rm", "-f", containerName).start().waitFor();
             } catch (Exception ignored) {}
-
             deleteDirectory(sessionDir.toFile());
         }
     }
@@ -121,12 +118,14 @@ public class DockerExecutionService {
                     private final Set<Point> targets;
                     private final Point player;
                     private final Set<Point> boxes;
+                    private final int cachedHash;
             
                     public SokobanState(boolean[][] walls, Set<Point> targets, Point player, Set<Point> boxes) {
                         this.walls = walls;
                         this.targets = targets;
                         this.player = player;
-                        this.boxes = boxes;
+                        this.boxes = Collections.unmodifiableSet(boxes);
+                        this.cachedHash = Objects.hash(player, boxes);
                     }
             
                     public boolean isWin() { return targets.containsAll(boxes); }
@@ -144,11 +143,12 @@ public class DockerExecutionService {
                         if (this == o) return true;
                         if (o == null || getClass() != o.getClass()) return false;
                         SokobanState that = (SokobanState) o;
+                        if (this.cachedHash != that.cachedHash) return false;
                         return Objects.equals(player, that.player) && Objects.equals(boxes, that.boxes);
                     }
             
                     @Override
-                    public int hashCode() { return Objects.hash(player, boxes); }
+                    public int hashCode() { return cachedHash; }
                 }
             
                 public interface SokobanHeuristic {
@@ -175,12 +175,20 @@ public class DockerExecutionService {
                 public static void main(String[] args) {
                     try {
                         String mapContent = %s;
-                        SokobanState initialState = parse(mapContent);
+                        boolean[][] initialWalls = parseWalls(mapContent);
+                        Set<Point> initialTargets = parseTargets(mapContent);
+                        Set<Point> initialBoxes = parseBoxes(mapContent);
+                        Point rawPlayer = parsePlayer(mapContent);
+            
+                        // Instantiate canonical state
+                        Point canonicalPlayer = getCanonicalPlayer(rawPlayer, initialBoxes, initialWalls);
+                        SokobanState initialState = new SokobanState(initialWalls, initialTargets, canonicalPlayer, initialBoxes);
+            
                         SokobanHeuristic heuristic = new UserHeuristic();
                         
                         long startTime = System.currentTimeMillis();
                         long nodesExpanded = 0;
-                        long maxNodesAllowed = 500000;
+                        long maxNodesAllowed = 2000000; // Easily handles macro-moves
             
                         PriorityQueue<Node> openSet = new PriorityQueue<>();
                         HashSet<SokobanState> closedSet = new HashSet<>();
@@ -198,8 +206,7 @@ public class DockerExecutionService {
                                 return;
                             }
             
-                            if (closedSet.contains(currentState)) continue;
-                            closedSet.add(currentState);
+                            if (!closedSet.add(currentState)) continue;
                             nodesExpanded++;
             
                             if (nodesExpanded > maxNodesAllowed) {
@@ -207,25 +214,42 @@ public class DockerExecutionService {
                                 return;
                             }
             
-                            for (int[] dir : DIRECTIONS) {
-                                int dx = dir[0]; int dy = dir[1];
-                                Point newPlayerPos = currentState.getPlayer().move(dx, dy);
+                            // MACRO-MOVE SEARCH: Find every square the player can currently walk to
+                            HashSet<Point> reachable = getReachable(currentState.getPlayer(), currentState.getBoxes(), currentState.getWalls());
             
-                                if (currentState.isWall(newPlayerPos.x(), newPlayerPos.y())) continue;
-                                Set<Point> newBoxes = new HashSet<>(currentState.getBoxes());
+                            // For every reachable square, check if we can push an adjacent box
+                            for (Point p : reachable) {
+                                for (int[] dir : DIRECTIONS) {
+                                    int dx = dir[0]; int dy = dir[1];
+                                    Point boxPos = p.move(dx, dy);
             
-                                if (newBoxes.contains(newPlayerPos)) {
-                                    Point newBoxPos = newPlayerPos.move(dx, dy);
-                                    if (currentState.isWall(newBoxPos.x(), newBoxPos.y()) || newBoxes.contains(newBoxPos)) continue;
-                                    newBoxes.remove(newPlayerPos);
-                                    newBoxes.add(newBoxPos);
-                                }
+                                    if (currentState.getBoxes().contains(boxPos)) {
+                                        Point pushTo = boxPos.move(dx, dy);
             
-                                SokobanState nextState = new SokobanState(currentState.getWalls(), currentState.getTargets(), newPlayerPos, newBoxes);
-                                if (!closedSet.contains(nextState)) {
-                                    int gNode = current.g + 1;
-                                    int hNode = heuristic.heur(nextState);
-                                    openSet.add(new Node(nextState, gNode, gNode + hNode));
+                                        if (!currentState.isWall(pushTo.x(), pushTo.y()) && !currentState.getBoxes().contains(pushTo)) {
+                                            
+                                            // Engine-level corner deadlock detection
+                                            if (!currentState.getTargets().contains(pushTo)) {
+                                                boolean wallX = currentState.isWall(pushTo.x() - 1, pushTo.y()) || currentState.isWall(pushTo.x() + 1, pushTo.y());
+                                                boolean wallY = currentState.isWall(pushTo.x(), pushTo.y() - 1) || currentState.isWall(pushTo.x(), pushTo.y() + 1);
+                                                if (wallX && wallY) continue; 
+                                            }
+            
+                                            Set<Point> newBoxes = new HashSet<>(currentState.getBoxes());
+                                            newBoxes.remove(boxPos);
+                                            newBoxes.add(pushTo);
+                                            
+                                            // Teleport player to the exact spot the box used to be, then canonicalize
+                                            Point newPlayer = getCanonicalPlayer(boxPos, newBoxes, currentState.getWalls());
+                                            SokobanState nextState = new SokobanState(currentState.getWalls(), currentState.getTargets(), newPlayer, newBoxes);
+                                            
+                                            if (!closedSet.contains(nextState)) {
+                                                int gNode = current.g + 1; // 1 push cost, not 1 step cost
+                                                int hNode = heuristic.heur(nextState);
+                                                openSet.add(new Node(nextState, gNode, gNode + hNode));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -235,39 +259,90 @@ public class DockerExecutionService {
                     }
                 }
             
+                // BFS to find all walking space
+                private static HashSet<Point> getReachable(Point start, Set<Point> boxes, boolean[][] walls) {
+                    Queue<Point> q = new LinkedList<>();
+                    HashSet<Point> visited = new HashSet<>();
+                    q.add(start);
+                    visited.add(start);
+                    while (!q.isEmpty()) {
+                        Point curr = q.poll();
+                        for (int[] dir : DIRECTIONS) {
+                            Point next = curr.move(dir[0], dir[1]);
+                            if (next.y() >= 0 && next.y() < walls.length && next.x() >= 0 && next.x() < walls[next.y()].length) {
+                                if (!walls[next.y()][next.x()] && !boxes.contains(next) && visited.add(next)) {
+                                    q.add(next);
+                                }
+                            }
+                        }
+                    }
+                    return visited;
+                }
+            
+                // Teleports player to the top-leftmost reachable square to normalize state hashing
+                private static Point getCanonicalPlayer(Point start, Set<Point> boxes, boolean[][] walls) {
+                    HashSet<Point> reachable = getReachable(start, boxes, walls);
+                    Point canonical = start;
+                    for (Point p : reachable) {
+                        if (p.y() < canonical.y() || (p.y() == canonical.y() && p.x() < canonical.x())) {
+                            canonical = p;
+                        }
+                    }
+                    return canonical;
+                }
+            
                 private static void printResult(boolean success, boolean solved, long nodes, long timeMs, String error) {
                     String errorStr = error == null ? "null" : "\\\"" + error.replace("\\\"", "\\\\\\\"") + "\\\"";
                     System.out.println("{\\\"success\\\":" + success + ", \\\"solved\\\":" + solved + ", \\\"nodesExpanded\\\":" + nodes + ", \\\"executionTimeMs\\\":" + timeMs + ", \\\"errorMessage\\\":" + errorStr + "}");
                 }
             
-                public static SokobanState parse(String content) {
+                public static boolean[][] parseWalls(String content) {
                     String[] lines = content.split("\\\\r?\\\\n");
                     int height = lines.length;
                     int width = 0;
                     for (String line : lines) width = Math.max(width, line.length());
-            
                     boolean[][] walls = new boolean[height][width];
-                    Set<Point> targets = new HashSet<>();
-                    Set<Point> boxes = new HashSet<>();
-                    Point player = null;
-            
                     for (int y = 0; y < height; y++) {
-                        String line = lines[y];
-                        for (int x = 0; x < line.length(); x++) {
-                            char c = line.charAt(x);
-                            Point p = new Point(x, y);
-                            switch (c) {
-                                case '#': walls[y][x] = true; break;
-                                case '@': player = p; break;
-                                case '+': player = p; targets.add(p); break;
-                                case '$': boxes.add(p); break;
-                                case '*': boxes.add(p); targets.add(p); break;
-                                case '.': targets.add(p); break;
-                                case ' ': break;
-                            }
+                        for (int x = 0; x < lines[y].length(); x++) {
+                            if (lines[y].charAt(x) == '#') walls[y][x] = true;
                         }
                     }
-                    return new SokobanState(walls, targets, player, boxes);
+                    return walls;
+                }
+            
+                public static Set<Point> parseTargets(String content) {
+                    Set<Point> targets = new HashSet<>();
+                    String[] lines = content.split("\\\\r?\\\\n");
+                    for (int y = 0; y < lines.length; y++) {
+                        for (int x = 0; x < lines[y].length(); x++) {
+                            char c = lines[y].charAt(x);
+                            if (c == '.' || c == '+' || c == '*') targets.add(new Point(x, y));
+                        }
+                    }
+                    return targets;
+                }
+            
+                public static Set<Point> parseBoxes(String content) {
+                    Set<Point> boxes = new HashSet<>();
+                    String[] lines = content.split("\\\\r?\\\\n");
+                    for (int y = 0; y < lines.length; y++) {
+                        for (int x = 0; x < lines[y].length(); x++) {
+                            char c = lines[y].charAt(x);
+                            if (c == '$' || c == '*') boxes.add(new Point(x, y));
+                        }
+                    }
+                    return boxes;
+                }
+            
+                public static Point parsePlayer(String content) {
+                    String[] lines = content.split("\\\\r?\\\\n");
+                    for (int y = 0; y < lines.length; y++) {
+                        for (int x = 0; x < lines[y].length(); x++) {
+                            char c = lines[y].charAt(x);
+                            if (c == '@' || c == '+') return new Point(x, y);
+                        }
+                    }
+                    return new Point(0, 0);
                 }
             }
             """;
